@@ -1,8 +1,9 @@
-torch==2.6.0+cu124
-torchaudio==2.6.0+cu124
+#torch==2.6.0+cu127
+torch>=2.6,<3.0
+torchaudio==2.6.0
 torchmetrics==1.7.3
 torchsde==0.2.6
-torchvision==0.21.0+cu124
+torchvision==0.21.0
 accelerate==1.8.1
 einops==0.8.1
 huggingface-hub==0.34.4

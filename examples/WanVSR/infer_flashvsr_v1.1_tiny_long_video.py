@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, re, time
+import os, re, time, subprocess
+import argparse
 import numpy as np
 from PIL import Image
 import imageio
@@ -31,11 +32,67 @@ def list_images_natural(folder: str):
 def largest_8n1_leq(n):  # 8n+1
     return 0 if n < 1 else ((n - 1)//8)*8 + 1
 
+def smallest_8n1_geq(n):  # 最小的 8n+1 且 >= n
+    if n <= 1:
+        return 1
+    rem = (n - 1) % 8
+    return n if rem == 0 else n + (8 - rem)
+
 def is_video(path):
     return os.path.isfile(path) and path.lower().endswith(('.mp4','.mov','.avi','.mkv'))
 
+def has_audio_ffprobe(path: str) -> bool:
+    # 使用 ffprobe 检测源视频是否含音频流
+    try:
+        out = subprocess.check_output(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "a",
+                "-show_entries", "stream=index",
+                "-of", "csv=p=0",
+                path,
+            ],
+            stderr=subprocess.STDOUT,
+        )
+        return bool(out.strip())
+    except FileNotFoundError:
+        print("[Warn] 未检测到 ffprobe，跳过音频检测与合并。")
+        return False
+    except subprocess.CalledProcessError as e:
+        print(f"[Warn] ffprobe 检测音频失败：{e.output.decode(errors='ignore')}")
+        return False
+
+def mux_audio_from_src(src_video: str, dst_video: str):
+    """
+    将源视频音频复用到已生成的无声视频文件。
+    若失败，不影响原始无声视频。
+    """
+    tmp_out = dst_video + ".tmp_mux.mp4"
+    try:
+        subprocess.check_call(
+            [
+                "ffmpeg", "-y",
+                "-i", dst_video,    # 0: 目标视频（无声）
+                "-i", src_video,    # 1: 源视频（带音频）
+                "-map", "0:v", "-map", "1:a",
+                "-c:v", "copy", "-c:a", "copy",
+                tmp_out,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.STDOUT,
+        )
+        os.replace(tmp_out, dst_video)
+        print(f"[Audio] 已复用源视频音频到输出：{dst_video}")
+    except FileNotFoundError:
+        print("[Warn] 未检测到 ffmpeg，无法自动合并音频。")
+    except subprocess.CalledProcessError as e:
+        print(f"[Warn] ffmpeg 合并音频失败：{e}. 已保留无声版本：{dst_video}")
+        try: os.remove(tmp_out)
+        except Exception: pass
+
 def pil_to_tensor_neg1_1(img: Image.Image, dtype=torch.bfloat16, device='cuda'):
-    t = torch.from_numpy(np.asarray(img, np.uint8)).to(device=device, dtype=torch.float32)  # HWC
+    # 使用 .copy() 确保 numpy 数组可写，避免 PyTorch 关于只读数组的警告
+    t = torch.from_numpy(np.asarray(img, np.uint8).copy()).to(device=device, dtype=torch.float32)  # HWC
     t = t.permute(2,0,1) / 255.0 * 2.0 - 1.0                                              # CHW in [-1,1]
     return t.to(dtype)
 
@@ -84,7 +141,9 @@ def upscale_then_center_crop(img: Image.Image, scale: float, tW: int, tH: int) -
     return up.crop((l, t, l + tW, t + tH))
 
 
-def prepare_input_tensor(path: str, scale: float = 4, dtype=torch.bfloat16, device='cuda'):
+def prepare_input_tensor(path: str, scale: float = 4, dtype=torch.bfloat16, device='cuda', max_frames: int = None):
+    if max_frames is not None and max_frames < 5:
+        raise ValueError("max_frames 应该至少为 5（模型需要 8n+1 帧）。")
     if os.path.isdir(path):
         paths0 = list_images_natural(path)
         if not paths0:
@@ -99,9 +158,13 @@ def prepare_input_tensor(path: str, scale: float = 4, dtype=torch.bfloat16, devi
         print(f"[{os.path.basename(path)}] Scaled (x{scale:.2f}): {sW}x{sH} -> Target (128-multiple): {tW}x{tH}")
 
         paths = paths0 + [paths0[-1]] * 4
-        F = largest_8n1_leq(len(paths))
-        if F == 0:
-            raise RuntimeError(f"Not enough frames after padding in {path}. Got {len(paths)}.")
+        if max_frames is not None:
+            paths = paths[:max_frames + 4]
+        # 向上补齐到最近的 8n+1，避免截短视频
+        F = smallest_8n1_geq(len(paths))
+        pad = F - len(paths)
+        if pad > 0:
+            paths = paths + [paths[-1]] * pad
         paths = paths[:F]
         print(f"[{os.path.basename(path)}] Target Frames (8n-3): {F-4}")
 
@@ -152,6 +215,8 @@ def prepare_input_tensor(path: str, scale: float = 4, dtype=torch.bfloat16, devi
         print(f"[{os.path.basename(path)}] Scaled (x{scale:.2f}): {sW}x{sH} -> Target (128-multiple): {tW}x{tH}")
 
         idx = list(range(total)) + [total-1]*4
+        if max_frames is not None:
+            idx = idx[:max_frames + 4]
         F = largest_8n1_leq(len(idx))
         if F == 0:
             rdr.close()
@@ -197,14 +262,33 @@ def init_pipeline():
     pipe.init_cross_kv(); pipe.load_models_to_device(["dit","vae"])
     return pipe
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="FlashVSR v1.1 tiny long video 推理脚本")
+    parser.add_argument("--input", type=str, default="./inputs/example4.mp4", help="输入视频或帧目录路径")
+    parser.add_argument("--output", type=str, default=None, help="输出视频文件路径（默认自动命名到 ./results）")
+    parser.add_argument("--scale", type=float, default=4.0, help="放大倍数")
+    parser.add_argument("--sparse_ratio", type=float, default=2.0, help="稀疏比，推荐 1.5 或 2.0")
+    parser.add_argument("--seed", type=int, default=0, help="随机种子")
+    parser.add_argument("--max_frames", type=int, default=None, help="最多处理的原始帧数（不含末尾 padding），需 >=5")
+    parser.add_argument("--device", type=str, default="cuda", help="设备：cuda 或 cpu")
+    parser.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16", "fp32"], help="推理精度")
+    parser.add_argument("--keep_audio", action="store_true", dest="keep_audio", help="尝试将源视频音频复用到输出（默认开启）")
+    parser.add_argument("--no_keep_audio", action="store_false", dest="keep_audio", help="关闭音频复用")
+    parser.set_defaults(keep_audio=True)
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
+
     RESULT_ROOT = "./results"
     os.makedirs(RESULT_ROOT, exist_ok=True)
-    inputs = [
-        "./inputs/example4.mp4",
-    ]
-    seed, scale, dtype, device = 0, 4.0, torch.bfloat16, 'cuda'
-    sparse_ratio = 2.0      # Recommended: 1.5 or 2.0. 1.5 → faster; 2.0 → more stable.
+    inputs = [args.input]
+
+    dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
+    dtype = dtype_map[args.dtype]
+    seed, scale, device = args.seed, args.scale, args.device
+    sparse_ratio = args.sparse_ratio      # Recommended: 1.5 or 2.0. 1.5 → faster; 2.0 → more stable.
     pipe = init_pipeline()
 
     for p in inputs:
@@ -213,7 +297,9 @@ def main():
         if name.startswith('.'):
             continue
         try:
-            LQ, th, tw, F, fps = prepare_input_tensor(p, scale=scale, dtype=dtype, device=device)
+            LQ, th, tw, F, fps = prepare_input_tensor(
+                p, scale=scale, dtype=dtype, device=device, max_frames=args.max_frames
+            )
         except Exception as e:
             print(f"[Error] {name}: {e}"); continue
 
@@ -227,9 +313,17 @@ def main():
         )
 
         video = tensor2video(video)
-        save_video(video, os.path.join(RESULT_ROOT, f"FlashVSR_v1.1_Tiny_Long_{name.split('.')[0]}_seed{seed}.mp4"), fps=fps, quality=5)
+        save_path = args.output if args.output else os.path.join(RESULT_ROOT, f"FlashVSR_v1.1_Tiny_Long_{name.split('.')[0]}_seed{seed}.mp4")
+        save_video(video, save_path, fps=fps, quality=5)
+
+        if args.keep_audio and is_video(p):
+            if has_audio_ffprobe(p):
+                mux_audio_from_src(p, save_path)
+            else:
+                print(f"[Audio] 源视频未检测到音频或工具缺失，跳过音频复用：{p}")
 
     print("Done.")
 
 if __name__ == "__main__":
     main()
+
