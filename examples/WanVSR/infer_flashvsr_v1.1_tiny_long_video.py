@@ -230,7 +230,7 @@ def prepare_input_tensor(path: str, scale: float = 4, dtype=torch.bfloat16, devi
                 img = Image.fromarray(rdr.get_data(i)).convert('RGB')
                 img_out = upscale_then_center_crop(img, scale=scale, tW=tW, tH=tH)
                 frames.append(pil_to_tensor_neg1_1(img_out, dtype, 'cpu'))
-                print(i, len(idx), end = '\r')
+                # print(i, len(idx), end = '\r')
         finally:
             try: rdr.close()
             except Exception: pass
